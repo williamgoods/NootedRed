@@ -21,14 +21,43 @@ jobs:
           submodules: "recursive"
       - name: Apply experimental Lilu DirectMemory support
         run: git -C Lilu apply ../Patches/Lilu-Ventura-DirectMemory.patch
+      - name: Build patched Lilu release
+        run: >
+          xcodebuild -project Lilu/Lilu.xcodeproj -configuration Release
+          -arch x86_64 CONFIGURATION_BUILD_DIR="$PWD/build/Lilu/Release" build
       - run: xcodebuild -configuration Debug -arch x86_64 build
       - run: xcodebuild -configuration Research\ Release -arch x86_64 build
       - run: xcodebuild -configuration Release -arch x86_64 build
+      - name: Package paired NootedRed and Lilu kexts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          lilu_kext="$PWD/build/Lilu/Release/Lilu.kext"
+          nred_kext="$PWD/build/Release/NootedRed.kext"
+          test -d "$lilu_kext"
+          test -d "$nred_kext"
+
+          file "$lilu_kext/Contents/MacOS/Lilu" | grep -q 'x86_64'
+          file "$nred_kext/Contents/MacOS/NootedRed" | grep -q 'x86_64'
+          plutil -lint "$lilu_kext/Contents/Info.plist" "$nred_kext/Contents/Info.plist"
+
+          mkdir -p "$PWD/package/Kexts"
+          ditto "$lilu_kext" "$PWD/package/Kexts/Lilu.kext"
+          ditto "$nred_kext" "$PWD/package/Kexts/NootedRed.kext"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$PWD/package/Kexts" \
+            "$PWD/package/NootedRed-Lilu-Ventura-22H730.zip"
+          unzip -l "$PWD/package/NootedRed-Lilu-Ventura-22H730.zip"
       - name: Upload to Artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: Artifacts
-          path: build/*/*.zip
+          name: NootedRed-Lilu-${{ github.run_number }}
+          if-no-files-found: error
+          path: |
+            build/*/*.zip
+            build/Lilu/*/*.zip
+            package/NootedRed-Lilu-Ventura-22H730.zip
       - name: Upload build
         if: startsWith(github.ref, 'refs/tags/')
         run: |
