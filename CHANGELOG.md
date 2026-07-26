@@ -1,5 +1,20 @@
 # Change log
 
+## v0.9.0-ventura-raven-gfx9-exp1
+
+### Experimental
+
+- Added the Ventura Raven GFX9 hardware-info compatibility patch.
+- Added the required paired Lilu DirectMemory support patch.
+- Added CI packaging for matching `Lilu.kext` and `NootedRed.kext` builds.
+- Added validation for x86_64 Mach-O binaries and kext property lists.
+
+> [!WARNING]
+> This is an experimental Hackintosh build for macOS Ventura 13.7.8
+> (22H730). Install `Lilu.kext` and `NootedRed.kext` from the same paired
+> archive, keep a bootable EFI backup, and do not mix either kext with an
+> official release.
+
 ## v0.8.10 (15/05/2026)
 
 ### Enhancements

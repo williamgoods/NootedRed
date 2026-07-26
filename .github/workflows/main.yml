@@ -64,7 +64,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           shopt -s nullglob
-          files=(build/*/*.zip)
+          files=(
+            build/*/*.zip
+            build/Lilu/*/*.zip
+            package/NootedRed-Lilu-Ventura-22H730.zip
+          )
           [ ${#files[@]} -gt 0 ] || { echo "No zip files found"; exit 1; }
           NOTES=$(awk '/^## '"${{ github.ref_name }}"'$/{flag=1; next} /^## v/{flag=0} flag' CHANGELOG.md | sed 's/^### /## /')
 
@@ -73,11 +77,16 @@ jobs:
             exit 1
           }
 
+          release_args=()
+          if [[ "${{ github.ref_name }}" == *-exp* ]]; then
+            release_args+=(--prerelease)
+          fi
+
           echo "$NOTES" | gh release create "${{ github.ref_name }}" "${files[@]}" \
             -t "${{ github.ref_name }}" \
             --verify-tag \
             --fail-on-no-commits \
-            --discussion-category Announcements \
+            "${release_args[@]}" \
             -F -
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
