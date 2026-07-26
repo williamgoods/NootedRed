@@ -21,6 +21,8 @@ jobs:
           submodules: "recursive"
       - name: Apply experimental Lilu DirectMemory support
         run: git -C Lilu apply ../Patches/Lilu-Ventura-DirectMemory.patch
+      - name: Link MacKernelSDK into Lilu
+        run: ln -s ../MacKernelSDK Lilu/MacKernelSDK
       - name: Build patched Lilu release
         run: >
           xcodebuild -project Lilu/Lilu.xcodeproj -configuration Release
