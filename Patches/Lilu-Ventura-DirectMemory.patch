@@ -1,0 +1,545 @@
+diff --git a/Lilu/Headers/kern_api.hpp b/Lilu/Headers/kern_api.hpp
+index 2306964..34ebd62 100644
+--- a/Lilu/Headers/kern_api.hpp
++++ b/Lilu/Headers/kern_api.hpp
+@@ -215,6 +215,16 @@ public:
+ 			PANIC("api", "onProcLoad failed with code %d", err);
+ 	}
+ 
++	/**
++	 *  Activates the single, opt-in NootedRed DirectMemory patch during plugin
++	 *  registration, before the graphics console can cause GLDriver pages to be
++	 *  validated and cached.
++	 *
++	 *  This private PoC extension is accepted only on Ventura with
++	 *  -lilunreduser and only for the hard-coded AMDRadeonX5000GLDriver path.
++	 */
++	EXPORT Error activateNRedDirectUserPatch(UserPatcher::BinaryModInfo *mod);
++
+ 	/**
+ 	 *  Kext loaded callback
+ 	 *  Note that you will get notified of all the requested kexts for speed reasons
+diff --git a/Lilu/Headers/kern_user.hpp b/Lilu/Headers/kern_user.hpp
+index ef64a59..dd85afc 100644
+--- a/Lilu/Headers/kern_user.hpp
++++ b/Lilu/Headers/kern_user.hpp
+@@ -95,7 +95,16 @@ public:
+ 		/*
+ 		 * Only applies to one process, not globally.
+ 		 */
+-		LocalOnly = 1
++		LocalOnly = 1,
++
++		/*
++		 * Match the find bytes directly in every code-signing page instead of
++		 * building a full-page fingerprint from the file on disk.  This is meant
++		 * for long, version-specific signatures when the file cannot be read at
++		 * Lilu's early init point.  Callers must make the signature sufficiently
++		 * unique because the vnode path is not available to cs_validate_*.
++		 */
++		DirectMemory = 2
+ 	};
+ 
+ 	/**
+@@ -183,6 +192,19 @@ public:
+ 	 */
+ 	bool registerPatches(ProcInfo **procs, size_t procNum, BinaryModInfo **mods, size_t modNum, t_BinaryLoaded callback, void *user);
+ 
++	/**
++	 *  Installs one DirectMemory-only binary patch before normal Lilu
++	 *  initialisation reaches the graphics-console callback.  This is intentionally
++	 *  narrow: it exists only so the NootedRed Ventura GLDriver patch can route the
++	 *  code-signing hook before the target pages enter the validation cache.
++	 *
++	 *  @param kernelPatcher active early-stage kernel patcher
++	 *  @param mod           one persistent DirectMemory-only binary modification
++	 *
++	 *  @return true when the validation hook was installed
++	 */
++	bool registerDirectPatchEarly(KernelPatcher &kernelPatcher, BinaryModInfo *mod);
++
+ 	/**
+ 	 *  Reads current process header
+ 	 *
+@@ -284,6 +306,8 @@ private:
+ 	 *  Kernel function wrappers
+ 	 */
+ 	static boolean_t codeSignValidatePageWrapper(void *blobs, memory_object_t pager, memory_object_offset_t page_offset, const void *data, unsigned *tainted);
++	static void codeSignValidatePageVenturaWrapper(void *vnode, memory_object_t pager, memory_object_offset_t page_offset,
++		const void *data, int *validated, int *tainted, int *nx);
+ 	static boolean_t codeSignValidateRangeWrapper(void *blobs, memory_object_t pager, memory_object_offset_t range_offset, const void *data, memory_object_size_t data_size, unsigned *tainted);
+ 	static vm_map_t swapTaskMap(task_t task, thread_t thread, vm_map_t map, boolean_t doswitch);
+ 	static vm_map_t vmMapSwitch(vm_map_t map);
+@@ -301,6 +325,13 @@ private:
+ 	 */
+ 	void performPagePatch(const void *data_ptr, size_t data_size);
+ 
++	/**
++	 *  Applies opt-in signature patches directly to one validated page.
++	 *
++	 *  @param page one PAGE_SIZE code-signing page
++	 */
++	void performDirectPagePatch(const uint8_t *page, size_t pageSize);
++
+ 	/**
+ 	 * dyld shared cache map entry structure
+ 	 */
+@@ -496,6 +527,28 @@ private:
+ 	 */
+ 	_Atomic(bool) activated = false;
+ 
++	/**
++	 *  One-shot log mask for direct page patches (the NRed-only mode keeps one mod).
++	 */
++	_Atomic(uint32_t) directPatchLogMask = 0;
++
++	/**
++	 *  Diagnostics for the direct page patch path.  directPagesScanned is a
++	 *  heartbeat proving the cs_validate hook actually fires; directPrefixLogMask
++	 *  logs the first prefix near-miss per patch so we can tell whether the target
++	 *  code pages flow through at all when the full signature never matches.
++	 */
++	_Atomic(uint64_t) directPagesScanned = 0;
++	_Atomic(uint32_t) directPrefixLogMask = 0;
++
++	/**
++	 *  The v6 early path owns exactly one persistent DirectMemory modification.
++	 *  Keeping it separate from binaryMod avoids depending on Lilu's later
++	 *  process-callback finalisation and its vector storage lifetime.
++	 */
++	BinaryModInfo *directBinaryMod {nullptr};
++	_Atomic(bool) directHookInstalled = false;
++
+ 	/**
+ 	 *  Validation cookie
+ 	 */
+@@ -561,6 +614,13 @@ private:
+ 	 */
+ 	bool hookMemoryAccess();
+ 
++	/**
++	 *  Routes only the code-signing validation hook required by DirectMemory
++	 *  patches.  Unlike hookMemoryAccess(), this does not resolve legacy task/vm
++	 *  symbols which are unavailable on modern macOS versions.
++	 */
++	bool hookDirectMemoryAccess();
++
+ 	/**
+ 	 *  Peforms the actual binary patching
+ 	 *
+diff --git a/Lilu/PrivateHeaders/kern_config.hpp b/Lilu/PrivateHeaders/kern_config.hpp
+index 1821c31..aa7e44f 100644
+--- a/Lilu/PrivateHeaders/kern_config.hpp
++++ b/Lilu/PrivateHeaders/kern_config.hpp
+@@ -168,6 +168,13 @@ private:
+ #endif
+ 
+ public:
++	/**
++	 *  Starts the scoped NootedRed DirectMemory user patcher while Lilu is still
++	 *  collecting plugin requests.  The kernel patcher has already completed its
++	 *  early initialisation at this point.
++	 */
++	bool activateNRedDirectUserPatch(UserPatcher::BinaryModInfo *mod);
++
+ 	/**
+ 	 *  Initialise kernel and user patchers from policy handler
+ 	 */
+@@ -254,6 +261,12 @@ public:
+ 	 */
+ 	UserPatcher userPatcher;
+ 
++	/**
++	 *  True when the v6 NootedRed-only validation hook was installed before the
++	 *  normal graphics-console initialisation stage.
++	 */
++	bool nredDirectUserPatcherActive {false};
++
+ 	/**
+ 	 *  Kernel patcher
+ 	 */
+diff --git a/Lilu/Sources/kern_api.cpp b/Lilu/Sources/kern_api.cpp
+index 757bdd9..5dc7cc4 100644
+--- a/Lilu/Sources/kern_api.cpp
++++ b/Lilu/Sources/kern_api.cpp
+@@ -213,6 +213,20 @@ LiluAPI::Error LiluAPI::onProcLoad(UserPatcher::ProcInfo *infos, size_t num, Use
+ 	return Error::NoError;
+ }
+ 
++LiluAPI::Error LiluAPI::activateNRedDirectUserPatch(UserPatcher::BinaryModInfo *mod) {
++	constexpr const char *NRedGLDriverPath =
++		"/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver";
++
++	if (getKernelVersion() != KernelVersion::Ventura)
++		return Error::IncompatibleOS;
++	if (ADDPR(config).isUserDisabled || !checkKernelArgument("-lilunreduser"))
++		return Error::Disabled;
++	if (mod == nullptr || mod->path == nullptr || strcmp(mod->path, NRedGLDriverPath) != 0)
++		return Error::UnsupportedFeature;
++
++	return ADDPR(config).activateNRedDirectUserPatch(mod) ? Error::NoError : Error::Offline;
++}
++
+ LiluAPI::Error LiluAPI::onEntitlementRequest(t_entitlementRequested callback, void *user) {
+ 	auto *ecall = stored_pair<t_entitlementRequested>::create();
+ 
+@@ -342,6 +356,34 @@ void LiluAPI::processUserLoadCallbacks(UserPatcher &patcher) {
+ 		return;
+ 	}
+ 
++	if (getKernelVersion() == KernelVersion::Ventura && checkKernelArgument("-lilunreduser")) {
++		// Lilu normally disables UserPatcher on Big Sur and newer.  This opt-in PoC
++		// re-enables it only for NootedRed's direct-page GLDriver binary patch.  Drop
++		// every process callback and every unrelated binary mod so older plugins do
++		// not become active as a side effect.
++		while (storedProcs.size() != 0)
++			storedProcs.erase(0);
++		while (binaryLoadedCallbacks.size() != 0)
++			binaryLoadedCallbacks.erase(0);
++
++		constexpr const char *NRedGLDriverPath =
++			"/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver";
++		size_t i = 0;
++		while (i < storedBinaryMods.size()) {
++			auto mod = storedBinaryMods[i];
++			if (mod == nullptr || mod->path == nullptr || strcmp(mod->path, NRedGLDriverPath) != 0)
++				storedBinaryMods.erase(i);
++			else
++				i++;
++		}
++
++		SYSLOG("api", "NRed-only Ventura UserPatcher retained %lu binary mod(s)", storedBinaryMods.size());
++	}
++
++	if (storedProcs.size() == 0 && storedBinaryMods.size() == 0) {
++		return;
++	}
++
+ 	size_t i = 0;
+ 	while (i < storedProcs.size()) {
+ 		if (storedProcs[i]->section == UserPatcher::ProcInfo::SectionDisabled)
+diff --git a/Lilu/Sources/kern_start.cpp b/Lilu/Sources/kern_start.cpp
+index ec7198c..3ddf035 100644
+--- a/Lilu/Sources/kern_start.cpp
++++ b/Lilu/Sources/kern_start.cpp
+@@ -118,7 +118,7 @@ bool Configuration::performCommonInit() {
+ 
+ 	lilu.processPatcherLoadCallbacks(kernelPatcher);
+ 
+-	bool ok = userPatcher.init(kernelPatcher, preferSlowMode);
++	bool ok = nredDirectUserPatcherActive || userPatcher.init(kernelPatcher, preferSlowMode);
+ 	if (ok) {
+ 		// We are safely locked, just need to ensure atomicity
+ 		atomic_store_explicit(&initialised, true, memory_order_relaxed);
+@@ -130,13 +130,31 @@ bool Configuration::performCommonInit() {
+ 		return false;
+ 	}
+ 
+-	lilu.processUserLoadCallbacks(userPatcher);
++	if (!nredDirectUserPatcherActive)
++		lilu.processUserLoadCallbacks(userPatcher);
+ 
+ 	lilu.activate(kernelPatcher, userPatcher);
+ 
+ 	return true;
+ }
+ 
++bool Configuration::activateNRedDirectUserPatch(UserPatcher::BinaryModInfo *mod) {
++	if (mod == nullptr || nredDirectUserPatcherActive ||
++		atomic_load_explicit(&initialised, memory_order_relaxed)) {
++		SYSLOG("config", "rejected late or duplicate NRed v6 DirectMemory activation");
++		return false;
++	}
++
++	if (!userPatcher.registerDirectPatchEarly(kernelPatcher, mod)) {
++		SYSLOG("config", "failed to activate NRed v6 DirectMemory patcher");
++		return false;
++	}
++
++	nredDirectUserPatcherActive = true;
++	SYSLOG("config", "NRed-only Ventura UserPatcher PoC v7 installed before graphics console");
++	return true;
++}
++
+ bool Configuration::performInit() {
+ 	kernelPatcher.init();
+ 
+@@ -244,8 +262,13 @@ bool Configuration::getBootArguments() {
+ 
+ 	betaForAll = checkKernelArgument(bootargBetaAll);
+ 	debugForAll = checkKernelArgument(bootargDebugAll);
++	const bool nredVenturaUserPatcher = getKernelVersion() == KernelVersion::Ventura &&
++		checkKernelArgument("-lilunreduser");
+ 	isUserDisabled = checkKernelArgument(bootargUserOff) ||
+-		getKernelVersion() <= KernelVersion::SnowLeopard || getKernelVersion() >= KernelVersion::BigSur;
++		getKernelVersion() <= KernelVersion::SnowLeopard ||
++		(getKernelVersion() >= KernelVersion::BigSur && !nredVenturaUserPatcher);
++	if (nredVenturaUserPatcher && !isUserDisabled)
++		SYSLOG("config", "allowing NRed-only Ventura UserPatcher PoC v7 early direct-page mode");
+ 
+ 	lilu_get_boot_args(bootargDelay, &ADDPR(debugPrintDelay), sizeof(ADDPR(debugPrintDelay)));
+ 
+@@ -312,6 +335,11 @@ bool Configuration::getBootArguments() {
+ 		preferSlowMode = true;
+ 	}
+ 
++	// AMDRadeonX5000GLDriver is a standalone bundle, not a dyld shared-cache image.
++	// Direct-page mode also must not read a shared-cache map during early boot.
++	if (nredVenturaUserPatcher)
++		preferSlowMode = true;
++
+ 	readArguments = true;
+ 
+ 	DBGLOG("config", "version %s (%s), args: disabled %d, debug %d, slow %d, decompress %d",
+diff --git a/Lilu/Sources/kern_user.cpp b/Lilu/Sources/kern_user.cpp
+index 695b9f1..4020a9f 100644
+--- a/Lilu/Sources/kern_user.cpp
++++ b/Lilu/Sources/kern_user.cpp
+@@ -144,9 +144,72 @@ bool UserPatcher::registerPatches(ProcInfo **procs, size_t procNum, BinaryModInf
+ 		}
+ 	}
+ 
++	// DirectMemory is deliberately a small, modern-macOS-compatible path.  It
++	// patches bytes while cs_validate_* is handling file-backed pages and does
++	// not need file parsing, dyld maps, exec listeners, or legacy task/vm helper
++	// symbols.  Requiring the full UserPatcher hook chain here is what prevented
++	// the Ventura PoC from activating.
++	bool directOnly = procNum == 0 && modNum != 0;
++	for (size_t i = 0; i < modNum && directOnly; i++) {
++		if (!mods[i]) {
++			directOnly = false;
++			break;
++		}
++
++		for (size_t p = 0; p < mods[i]->count; p++) {
++			auto &patch = mods[i]->patches[p];
++			if (patch.section != ProcInfo::SectionDisabled && !(patch.flags & DirectMemory)) {
++				directOnly = false;
++				break;
++			}
++		}
++	}
++
++	if (directOnly) {
++		if (modNum != 1 || mods[0] == nullptr) {
++			SYSLOG("user", "DirectMemory-only mode requires exactly one binary modification");
++			return false;
++		}
++
++		directBinaryMod = mods[0];
++		SYSLOG("user", "activating DirectMemory-only UserPatcher path");
++		return hookDirectMemoryAccess();
++	}
++
+ 	return loadFilesForPatching() && (!patchDyldSharedCache || loadDyldSharedCacheMapping()) && loadLookups() && hookMemoryAccess();
+ }
+ 
++bool UserPatcher::registerDirectPatchEarly(KernelPatcher &kernelPatcher, BinaryModInfo *mod) {
++	if (mod == nullptr || mod->patches == nullptr || mod->count == 0 || directBinaryMod != nullptr) {
++		SYSLOG("user", "rejected invalid or duplicate early DirectMemory registration");
++		return false;
++	}
++
++	for (size_t p = 0; p < mod->count; p++) {
++		auto &patch = mod->patches[p];
++		if (patch.section != ProcInfo::SectionDisabled &&
++			(!(patch.flags & DirectMemory) || patch.cpu != CPU_TYPE_X86_64 ||
++			 patch.find == nullptr || patch.replace == nullptr || patch.size < 16 ||
++			 patch.count != 1)) {
++			SYSLOG("user", "rejected unsafe early DirectMemory patch %lu", p);
++			return false;
++		}
++	}
++
++	that = this;
++	patcher = &kernelPatcher;
++	directBinaryMod = mod;
++
++	if (!hookDirectMemoryAccess()) {
++		directBinaryMod = nullptr;
++		return false;
++	}
++
++	activate();
++	SYSLOG("user", "v6 early DirectMemory patcher active before graphics console");
++	return true;
++}
++
+ void UserPatcher::deinit() {
+ 	// Silently return if disabled
+ 	if (ADDPR(config).isUserDisabled)
+@@ -169,7 +232,11 @@ void UserPatcher::performPagePatch(const void *data_ptr, size_t data_size) {
+ 		size_t maybe = 0;
+ 		auto ptr = static_cast<const uint8_t *>(data_ptr) + data_off;
+ 
+-		if (sz > 0) {
++		const size_t remaining = data_size - data_off;
++		const size_t pageSize = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
++		that->performDirectPagePatch(ptr, pageSize);
++
++		if (sz > 0 && pageSize == PAGE_SIZE) {
+ 			for (size_t i = 0; i < Lookup::matchNum && maybe != sz; i++) {
+ 				uint64_t value = *reinterpret_cast<const uint64_t *>(ptr + lookup.offs[i]);
+ 
+@@ -258,12 +325,93 @@ void UserPatcher::performPagePatch(const void *data_ptr, size_t data_size) {
+ 	}
+ }
+ 
++void UserPatcher::performDirectPagePatch(const uint8_t *page, size_t pageSize) {
++	if (!page || pageSize == 0)
++		return;
++
++	// Heartbeat: proves the cs_validate hook is firing.  Logged sparsely so it
++	// does not flood the log on the hot code-signing path.
++	uint64_t scanned = atomic_fetch_add_explicit(&directPagesScanned, 1, memory_order_relaxed) + 1;
++	if (scanned == 1 || (scanned & 0x3FFFF) == 0)
++		SYSLOG("user", "direct page patch scan heartbeat %llu", scanned);
++
++	auto mod = directBinaryMod;
++	if (mod == nullptr)
++		return;
++
++	for (size_t p = 0; p < mod->count; p++) {
++		auto &patch = mod->patches[p];
++		if (patch.section == ProcInfo::SectionDisabled || !(patch.flags & DirectMemory) ||
++			patch.cpu != CPU_TYPE_X86_64 ||
++			!patch.find || !patch.replace || patch.size == 0 || patch.size > pageSize || patch.count == 0)
++			continue;
++
++		auto current = page;
++		auto last = page + pageSize - patch.size;
++		size_t skip = patch.skip;
++		size_t count = patch.count;
++
++		while (current <= last && count != 0) {
++			if (*current != *patch.find || memcmp(current, patch.find, patch.size) != 0) {
++				// Prefix near-miss probe: if a decent prefix of the signature
++				// matches but the full pattern does not, log it once per patch.
++				// This distinguishes "the target code page never flows through"
++				// from "it does, but the bytes differ from what we hard-coded".
++				if (*current == *patch.find && patch.size >= 8 && memcmp(current, patch.find, 8) == 0 &&
++					p < sizeof(directPrefixLogMask) * 8) {
++					const uint32_t bit = 1U << p;
++					if (!(atomic_fetch_or_explicit(&directPrefixLogMask, bit, memory_order_relaxed) & bit))
++						SYSLOG("user", "direct patch %lu prefix matched but full %lu-byte signature did not; "
++							"page bytes %02X %02X %02X %02X %02X %02X %02X %02X",
++							p, patch.size, current[0], current[1], current[2], current[3],
++							current[4], current[5], current[6], current[7]);
++				}
++				current++;
++				continue;
++			}
++
++			if (skip != 0) {
++				skip--;
++				current += patch.size;
++				continue;
++			}
++
++			DBGLOG("user", "found direct page patch %lu (%lu bytes)", p, patch.size);
++			if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
++				SYSLOG("user", "failed to obtain write permissions for direct page patch %lu", p);
++				break;
++			}
++
++			lilu_os_memcpy(const_cast<uint8_t *>(current), patch.replace, patch.size);
++			if (p < sizeof(directPatchLogMask) * 8) {
++				const uint32_t bit = 1U << p;
++				if (!(atomic_fetch_or_explicit(&directPatchLogMask, bit, memory_order_relaxed) & bit))
++					SYSLOG("user", "applied NRed direct page patch %lu (%lu bytes)", p, patch.size);
++			}
++			if (MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock) != KERN_SUCCESS)
++				SYSLOG("user", "failed to restore write permissions after direct page patch %lu", p);
++
++			count--;
++			current += patch.size;
++		}
++	}
++}
++
+ boolean_t UserPatcher::codeSignValidatePageWrapper(void *blobs, memory_object_t pager, memory_object_offset_t page_offset, const void *data, unsigned *tainted) {
+ 	boolean_t res = FunctionCast(codeSignValidatePageWrapper, that->orgCodeSignValidatePageWrapper)(blobs, pager, page_offset, data, tainted);
+ 	if (res) that->performPagePatch(data, PAGE_SIZE);
+ 	return res;
+ }
+ 
++void UserPatcher::codeSignValidatePageVenturaWrapper(void *vnode, memory_object_t pager, memory_object_offset_t page_offset,
++	const void *data, int *validated, int *tainted, int *nx) {
++	FunctionCast(codeSignValidatePageVenturaWrapper, that->orgCodeSignValidatePageWrapper)(
++		vnode, pager, page_offset, data, validated, tainted, nx);
++
++	if (validated != nullptr && *validated)
++		that->performPagePatch(data, PAGE_SIZE);
++}
++
+ boolean_t UserPatcher::codeSignValidateRangeWrapper(void *blobs, memory_object_t pager, memory_object_offset_t range_offset, const void *data, memory_object_size_t data_size, unsigned *tainted) {
+ 	boolean_t res = FunctionCast(codeSignValidateRangeWrapper, that->orgCodeSignValidateRangeWrapper)(blobs, pager, range_offset, data, data_size, tainted);
+ 
+@@ -821,7 +969,8 @@ bool UserPatcher::loadFilesForPatching() {
+ 		bool hasPatches = false;
+ 
+ 		for (size_t p = 0; p < binaryMod[i]->count; p++) {
+-			if (binaryMod[i]->patches[p].section != ProcInfo::SectionDisabled) {
++			if (binaryMod[i]->patches[p].section != ProcInfo::SectionDisabled &&
++				!(binaryMod[i]->patches[p].flags & DirectMemory)) {
+ 				hasPatches = true;
+ 				break;
+ 			}
+@@ -847,7 +996,7 @@ bool UserPatcher::loadFilesForPatching() {
+ 			for (size_t p = 0; p < binaryMod[i]->count; p++) {
+ 				auto &patch = binaryMod[i]->patches[p];
+ 
+-				if (patch.section == ProcInfo::SectionDisabled) {
++				if (patch.section == ProcInfo::SectionDisabled || patch.flags & DirectMemory) {
+ 					DBGLOG("user", "skipping not requested patch %s for %lu", binaryMod[i]->path, p);
+ 					continue;
+ 				}
+@@ -1149,6 +1298,48 @@ bool UserPatcher::hookMemoryAccess() {
+ 	return true;
+ }
+ 
++bool UserPatcher::hookDirectMemoryAccess() {
++	if (atomic_load_explicit(&directHookInstalled, memory_order_relaxed))
++		return true;
++
++	// Ventura keeps cs_validate_range for explicit range validation, but normal
++	// file-backed Mach-O page faults use the newer seven-argument
++	// cs_validate_page ABI.  Routing only the first symbol therefore reports
++	// success while missing standalone dylibs such as AMDRadeonX5000GLDriver.
++	if (getKernelVersion() == KernelVersion::Ventura) {
++		KernelPatcher::RouteRequest routes[] {
++			{"_cs_validate_range", codeSignValidateRangeWrapper, orgCodeSignValidateRangeWrapper},
++			{"_cs_validate_page", codeSignValidatePageVenturaWrapper, orgCodeSignValidatePageWrapper},
++		};
++		if (!patcher->routeMultipleLong(KernelPatcher::KernelID, routes, arrsize(routes))) {
++			SYSLOG("user", "DirectMemory failed to route Ventura cs_validate_range/page pair");
++			return false;
++		}
++
++		atomic_store_explicit(&directHookInstalled, true, memory_order_relaxed);
++		SYSLOG("user", "DirectMemory v7 routed Ventura cs_validate_range/page pair");
++		return true;
++	}
++
++	KernelPatcher::RouteRequest rangeRoute {"_cs_validate_range", codeSignValidateRangeWrapper, orgCodeSignValidateRangeWrapper};
++	if (patcher->routeMultipleLong(KernelPatcher::KernelID, &rangeRoute, 1)) {
++		atomic_store_explicit(&directHookInstalled, true, memory_order_relaxed);
++		SYSLOG("user", "DirectMemory routed _cs_validate_range");
++		return true;
++	}
++
++	patcher->clearError();
++	KernelPatcher::RouteRequest pageRoute {"_cs_validate_page", codeSignValidatePageWrapper, orgCodeSignValidatePageWrapper};
++	if (patcher->routeMultipleLong(KernelPatcher::KernelID, &pageRoute, 1)) {
++		atomic_store_explicit(&directHookInstalled, true, memory_order_relaxed);
++		SYSLOG("user", "DirectMemory routed _cs_validate_page");
++		return true;
++	}
++
++	SYSLOG("user", "DirectMemory failed to resolve both cs_validate hooks");
++	return false;
++}
++
+ void UserPatcher::activate() {
+ 	atomic_store_explicit(&activated, true, memory_order_relaxed);
+ }
